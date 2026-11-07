@@ -156,3 +156,4 @@ def restore(d):
         }
     except (KeyError, TypeError, ValueError, IndexError):
         return None
+
