@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none}
+html,body{margin:0;padding:0;background:transparent;font-family:"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif}
+#app{max-width:440px;margin:0 auto;padding:4px 6px 10px;touch-action:none}
+.top{display:flex;gap:8px;margin-bottom:8px}
+.box{flex:1;background:#bbada0;border-radius:8px;padding:6px 4px;text-align:center;color:#eee4da}
+.box span{display:block;font-size:12px}
+.box b{font-size:20px;color:#fff;font-variant-numeric:tabular-nums}
+.bar{display:flex;gap:8px;margin-bottom:8px}
+button{flex:1;border:0;border-radius:8px;padding:11px 6px;font-size:16px;font-weight:700;background:#8f7a66;color:#f9f6f2;cursor:pointer;font-family:inherit}
+button:disabled{opacity:.4;cursor:default}
+button:active:not(:disabled){filter:brightness(.9)}
+button:focus-visible{outline:3px solid #edc22e;outline-offset:2px}
+.wrap{position:relative;background:#bbada0;border-radius:10px;padding:2.5%;container-type:inline-size}
+.board{display:grid;grid-template-columns:repeat(4,1fr);gap:2.6%}
+.t{aspect-ratio:1;border-radius:6px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:9.5cqw}
+.t.d3{font-size:8cqw}.t.d4{font-size:6.5cqw}.t.d5{font-size:5cqw}
+.pop{animation:pop .15s ease-out}
+@keyframes pop{from{transform:scale(.3)}to{transform:scale(1)}}
+@media (prefers-reduced-motion:reduce){.pop{animation:none}}
+.over{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(238,228,218,.78);border-radius:10px;font-size:8cqw;font-weight:800;color:#776e65}
+.over.show{display:flex}
+#msg{margin-top:8px;text-align:center;font-size:14px;min-height:20px}
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="top">
+    <div class="box"><span>分数</span><b id="score">0</b></div>
+    <div class="box"><span>最高分</span><b id="best">0</b></div>
+    <div class="box"><span>用时</span><b id="time">00:00</b></div>
+  </div>
+  <div class="bar">
+    <button id="undo">撤销 <small id="ucount"></small></button>
+    <button id="new">新游戏</button>
+  </div>
+  <div class="wrap"><div class="board" id="board"></div><div class="over" id="over">游戏结束</div></div>
+  <div id="msg">加载中…</div>
+</div>
+<script>
+const KEY = "streamlit2048_save_v1";
+const $ = id => document.getElementById(id);
+const COLORS = {0:["rgba(238,228,218,.35)","#776e65"],2:["#eee4da","#776e65"],4:["#ede0c8","#776e65"],
+  8:["#f2b179","#f9f6f2"],16:["#f59563","#f9f6f2"],32:["#f67c5f","#f9f6f2"],64:["#f65e3b","#f9f6f2"],
+  128:["#edcf72","#f9f6f2"],256:["#edcc61","#f9f6f2"],512:["#edc850","#f9f6f2"],
+  1024:["#edc53f","#f9f6f2"],2048:["#edc22e","#f9f6f2"]};
+
+let S = null, save = null, renderedAt = 0, bootSent = false;
+let busy = false, busyTimer = null, pending = null, newArmed = null;
+
+function post(type, extra) {
+  window.parent.postMessage(Object.assign({isStreamlitMessage: true, type}, extra || {}), "*");
+}
+const setHeight = () => post("streamlit:setFrameHeight", {height: document.documentElement.scrollHeight + 4});
+
+function curElapsed() {
+  if (!S) return 0;
+  return S.elapsed + (S.running ? (performance.now() - renderedAt) / 1000 : 0);
+}
+function fmt(s) {
+  s = Math.floor(s);
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60, p = n => String(n).padStart(2, "0");
+  return (h ? h + ":" : "") + p(m) + ":" + p(x);
+}
+
+function emit(ev) {
+  ev.id = Date.now() + "-" + Math.random().toString(36).slice(2);
+  ev.elapsed = curElapsed();
+  busy = true;
+  clearTimeout(busyTimer);
+  busyTimer = setTimeout(() => { busy = false; flushPending(); }, 1500);
+  post("streamlit:setComponentValue", {value: ev, dataType: "json"});
+}
+function flushPending() {
+  if (pending && S && !busy) { const d = pending; pending = null; doMove(d); }
+}
+function doMove(dir) {
+  if (!S || S.over) return;
+  if (busy) { pending = dir; return; }   // 上一步还在处理，排队 1 步
+  emit({type: "move", dir});
+}
+function doUndo() {
+  if (!S || S.undo_n === 0) return;
+  pending = null;
+  emit({type: "undo"});
+}
+
+function persist() {
+  if (!save) return;
+  try { localStorage.setItem(KEY, JSON.stringify(Object.assign({}, save, {elapsed: curElapsed()}))); } catch (e) {}
+}
+
+function draw() {
+  $("score").textContent = S.score;
+  $("best").textContent = S.best;
+  $("time").textContent = fmt(curElapsed());
+  $("undo").disabled = S.undo_n === 0;
+  $("ucount").textContent = S.undo_n ? "(" + S.undo_n + ")" : "";
+  $("board").innerHTML = S.board.flat().map((v, i) => {
+    const c = COLORS[v] || ["#3c3a32", "#f9f6f2"];
+    const cls = "t d" + String(v).length + (i === S.new_idx ? " pop" : "");
+    return '<div class="' + cls + '" style="background:' + c[0] + ';color:' + c[1] + '">' + (v || "") + "</div>";
+  }).join("");
+  $("over").classList.toggle("show", S.over);
+  $("msg").textContent = S.over ? "游戏结束，点“撤销”可以回到之前的步骤"
+    : S.won ? "你合成了 2048，可以继续挑战更高分"
+    : "滑动棋盘或用方向键 / WASD 移动，Z 撤销";
+  setHeight();
+}
+
+window.addEventListener("message", e => {
+  const d = e.data;
+  if (!d || d.type !== "streamlit:render") return;
+  const a = d.args || {};
+  if (d.theme && d.theme.textColor) $("msg").style.color = d.theme.textColor;
+  if (a.boot) {                       // 首次加载：先看浏览器里有没有存档
+    if (!bootSent) {
+      bootSent = true;
+      let data = null;
+      try { data = JSON.parse(localStorage.getItem(KEY)); } catch (err) {}
+      emit({type: "boot", data});
+    }
+    return;
+  }
+  S = a.state; save = a.save;
+  renderedAt = performance.now();
+  busy = false; clearTimeout(busyTimer);
+  draw(); persist(); flushPending();
+});
+
+setInterval(() => { if (S) $("time").textContent = fmt(curElapsed()); }, 250);
+setInterval(persist, 5000);
+document.addEventListener("visibilitychange", persist);
+window.addEventListener("pagehide", persist);
+
+// 滑动（触屏和鼠标拖动都支持）
+let sx = 0, sy = 0, tracking = false;
+const app = $("app");
+app.addEventListener("pointerdown", e => { sx = e.clientX; sy = e.clientY; tracking = true; });
+app.addEventListener("pointercancel", () => { tracking = false; });
+app.addEventListener("pointerup", e => {
+  if (!tracking) return;
+  tracking = false;
+  const dx = e.clientX - sx, dy = e.clientY - sy;
+  if (Math.max(Math.abs(dx), Math.abs(dy)) < 24) return;
+  doMove(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "right" : "left") : (dy > 0 ? "down" : "up"));
+});
+
+// 键盘（iframe 内 + 父页面）
+const KEYS = {ArrowUp:"up",ArrowDown:"down",ArrowLeft:"left",ArrowRight:"right",w:"up",s:"down",a:"left",d:"right",W:"up",S:"down",A:"left",D:"right"};
+function onKey(e) {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const t = e.target && e.target.tagName;
+  if (t === "INPUT" || t === "TEXTAREA") return;
+  if (KEYS[e.key]) { e.preventDefault(); doMove(KEYS[e.key]); }
+  else if (e.key === "z" || e.key === "Z") doUndo();
+}
+document.addEventListener("keydown", onKey);
+try { window.parent.document.addEventListener("keydown", onKey); } catch (e) {}
+
+$("undo").addEventListener("click", doUndo);
+$("new").addEventListener("click", () => {
+  if (!S) return;
+  if (S.score === 0 || newArmed) {     // 无进度直接开；否则需要再点一次确认
+    clearTimeout(newArmed); newArmed = null; $("new").textContent = "新游戏";
+    pending = null; emit({type: "new"});
+  } else {
+    $("new").textContent = "再点一次确认";
+    newArmed = setTimeout(() => { newArmed = null; $("new").textContent = "新游戏"; }, 3000);
+  }
+});
+
+post("streamlit:componentReady", {apiVersion: 1});
+setHeight();
+</script>
+</body>
+</html>
